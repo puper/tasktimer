@@ -374,12 +374,13 @@ func (e *Engine[T]) Start() {
 // 如果引擎已经停止，则不会执行任何操作
 func (e *Engine[T]) Stop() {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if !e.running {
+		e.mu.Unlock()
 		return
 	}
 	e.running = false
 	close(e.stopChan)
+	e.mu.Unlock()
 }
 
 // run 是引擎的主运行循环
@@ -389,9 +390,13 @@ func (e *Engine[T]) run() {
 	ticker := time.NewTicker(time.Duration(e.resolution) * time.Millisecond)
 	defer ticker.Stop()
 
+	e.mu.RLock()
+	stopChan := e.stopChan
+	e.mu.RUnlock()
+
 	for {
 		select {
-		case <-e.stopChan:
+		case <-stopChan:
 			return
 		case <-ticker.C:
 			e.Tick()
