@@ -284,6 +284,97 @@ func TestStartStop(t *testing.T) {
 	}
 }
 
+func TestStopAndWaitSuccess(t *testing.T) {
+	engine := New[int](50 * time.Millisecond)
+	engine.Start()
+
+	started := make(chan struct{}, 1)
+	finished := make(chan struct{}, 1)
+
+	executeAt := time.Now().Add(50 * time.Millisecond).UnixMilli()
+	engine.Add(&Task[int]{
+		JobID:     "wait-success",
+		ExecuteAt: executeAt,
+		Data:      1,
+		Callback: func(task *Task[int]) {
+			started <- struct{}{}
+			time.Sleep(150 * time.Millisecond)
+			finished <- struct{}{}
+		},
+	})
+
+	select {
+	case <-started:
+	case <-time.After(1 * time.Second):
+		t.Fatal("callback should start before StopAndWait")
+	}
+
+	start := time.Now()
+	ok := engine.StopAndWait(1 * time.Second)
+	elapsed := time.Since(start)
+
+	if !ok {
+		t.Fatal("StopAndWait should return true when callback completes in timeout")
+	}
+
+	select {
+	case <-finished:
+	default:
+		t.Fatal("callback should be finished when StopAndWait returns true")
+	}
+
+	if elapsed < 120*time.Millisecond {
+		t.Errorf("StopAndWait should wait for callback completion, elapsed=%v", elapsed)
+	}
+}
+
+func TestStopAndWaitTimeout(t *testing.T) {
+	engine := New[int](50 * time.Millisecond)
+	engine.Start()
+
+	started := make(chan struct{}, 1)
+	var finished int32
+
+	executeAt := time.Now().Add(50 * time.Millisecond).UnixMilli()
+	engine.Add(&Task[int]{
+		JobID:     "wait-timeout",
+		ExecuteAt: executeAt,
+		Data:      1,
+		Callback: func(task *Task[int]) {
+			started <- struct{}{}
+			time.Sleep(300 * time.Millisecond)
+			atomic.StoreInt32(&finished, 1)
+		},
+	})
+
+	select {
+	case <-started:
+	case <-time.After(1 * time.Second):
+		t.Fatal("callback should start before StopAndWait")
+	}
+
+	start := time.Now()
+	ok := engine.StopAndWait(50 * time.Millisecond)
+	elapsed := time.Since(start)
+
+	if ok {
+		t.Fatal("StopAndWait should return false when timeout reached")
+	}
+
+	if elapsed < 40*time.Millisecond {
+		t.Errorf("StopAndWait should wait close to timeout before returning, elapsed=%v", elapsed)
+	}
+
+	if atomic.LoadInt32(&finished) != 0 {
+		t.Fatal("callback should not have finished when StopAndWait timed out")
+	}
+
+	time.Sleep(350 * time.Millisecond)
+	if atomic.LoadInt32(&finished) == 0 {
+		t.Fatal("callback should finish eventually after timeout return")
+	}
+}
+
 func TestMultipleTicks(t *testing.T) {
 	engine := New[int](50 * time.Millisecond)
 	var callbackCount int32

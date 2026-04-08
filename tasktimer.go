@@ -21,6 +21,8 @@ type Task[T any] struct {
 type Engine[T any] struct {
 	mu sync.RWMutex // 读写锁，保证并发安全
 
+	callbackMu sync.Mutex // 回调计数锁，保护活跃回调计数和完成通知通道
+
 	slots          map[int64]map[string]*Task[T]  // 时间槽数据，key 为时间槽的开始时间戳，value 为该时间槽内的任务映射
 	jobToSlot      map[string]int64               // 任务 ID 到时间槽的映射，用于快速查找任务所在的时间槽
 	topicIndex     map[string]map[string]struct{} // 主题索引，key 为主题名称，value 为该主题下的任务 ID 集合
@@ -31,6 +33,8 @@ type Engine[T any] struct {
 	stopChan          chan struct{}               // 停止信号通道
 	errorHandler      func(*Task[T], interface{}) // 错误回调函数，用于处理任务执行中的 panic
 	workerPool        chan struct{}               // 工作池，限制并发 goroutine 数量
+	activeCallbacks   int                         // 当前活跃回调数量
+	callbacksDoneChan chan struct{}               // 当活跃回调归零时关闭，用于 StopAndWait 等待
 	lastProcessedSlot int64                       // 上次处理的时间槽 key，用于优化扫描范围
 }
 
@@ -56,15 +60,19 @@ func New[T any](res time.Duration, maxWorkers ...int) *Engine[T] {
 		workers = maxWorkers[0]
 	}
 
+	callbacksDoneChan := make(chan struct{})
+	close(callbacksDoneChan)
+
 	return &Engine[T]{
-		slots:          make(map[int64]map[string]*Task[T]),
-		jobToSlot:      make(map[string]int64),
-		topicIndex:     make(map[string]map[string]struct{}),
-		topicCallbacks: make(map[string]func(*Task[T])),
-		resolution:     int64(res / time.Millisecond),
-		running:        false,
-		stopChan:       make(chan struct{}),
-		workerPool:     make(chan struct{}, workers),
+		slots:             make(map[int64]map[string]*Task[T]),
+		jobToSlot:         make(map[string]int64),
+		topicIndex:        make(map[string]map[string]struct{}),
+		topicCallbacks:    make(map[string]func(*Task[T])),
+		resolution:        int64(res / time.Millisecond),
+		running:           false,
+		stopChan:          make(chan struct{}),
+		workerPool:        make(chan struct{}, workers),
+		callbacksDoneChan: callbacksDoneChan,
 	}
 }
 
@@ -129,7 +137,7 @@ func (tx *Tx[T]) Add(task *Task[T]) bool {
 	// 3. 时间槽已被 Tick 处理过（slotKey <= lastProcessedSlot）
 	if slotKey < currentSlotKey || task.ExecuteAt <= now || slotKey <= e.lastProcessedSlot {
 		// 任务已过期或应该立即执行
-		go e.executeTask(task)
+		e.dispatchTask(task)
 		return true
 	}
 
@@ -329,6 +337,15 @@ func (e *Engine[T]) CancelTopic(topic string) int {
 // executeTask 执行单个任务，处理 panic 恢复和并发限制
 // 这是一个内部辅助方法
 func (e *Engine[T]) executeTask(task *Task[T]) {
+	defer func() {
+		e.callbackMu.Lock()
+		e.activeCallbacks--
+		if e.activeCallbacks == 0 {
+			close(e.callbacksDoneChan)
+		}
+		e.callbackMu.Unlock()
+	}()
+
 	// 获取工作池槽位（限制并发）
 	e.workerPool <- struct{}{}
 	defer func() { <-e.workerPool }()
@@ -381,6 +398,44 @@ func (e *Engine[T]) Stop() {
 	e.running = false
 	close(e.stopChan)
 	e.mu.Unlock()
+}
+
+// StopAndWait 停止引擎并等待已派发回调完成
+// timeout <= 0 时无限等待，直到所有回调结束
+// timeout > 0 时最多等待指定时长，完成返回 true，超时返回 false
+func (e *Engine[T]) StopAndWait(timeout time.Duration) bool {
+	e.Stop()
+
+	e.callbackMu.Lock()
+	doneChan := e.callbacksDoneChan
+	e.callbackMu.Unlock()
+
+	if timeout <= 0 {
+		<-doneChan
+		return true
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-doneChan:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// dispatchTask 统一任务异步派发入口，负责活跃回调计数
+func (e *Engine[T]) dispatchTask(task *Task[T]) {
+	e.callbackMu.Lock()
+	if e.activeCallbacks == 0 {
+		e.callbacksDoneChan = make(chan struct{})
+	}
+	e.activeCallbacks++
+	e.callbackMu.Unlock()
+
+	go e.executeTask(task)
 }
 
 // run 是引擎的主运行循环
@@ -470,6 +525,6 @@ func (e *Engine[T]) Tick() {
 
 	// 异步执行任务回调（受工作池限制）
 	for _, task := range tasksToExecute {
-		go e.executeTask(task)
+		e.dispatchTask(task)
 	}
 }
