@@ -30,6 +30,7 @@ type Engine[T any] struct {
 
 	resolution        int64                       // 时间精度（毫秒），决定时间槽的大小
 	running           bool                        // 引擎运行状态标志
+	startedOnce       bool                        // 是否至少启动过一次（用于区分冷启动与 Stop 后状态）
 	stopChan          chan struct{}               // 停止信号通道
 	errorHandler      func(*Task[T], interface{}) // 错误回调函数，用于处理任务执行中的 panic
 	workerPool        chan struct{}               // 工作池，限制并发 goroutine 数量
@@ -135,10 +136,20 @@ func (tx *Tx[T]) Add(task *Task[T]) bool {
 	// 1. 时间槽已过期（slotKey < currentSlotKey）
 	// 2. 任务执行时间已过（task.ExecuteAt <= now）
 	// 3. 时间槽已被 Tick 处理过（slotKey <= lastProcessedSlot）
-	if slotKey < currentSlotKey || task.ExecuteAt <= now || slotKey <= e.lastProcessedSlot {
-		// 任务已过期或应该立即执行
-		e.dispatchTask(task)
-		return true
+	shouldDispatchNow := slotKey < currentSlotKey || task.ExecuteAt <= now || slotKey <= e.lastProcessedSlot
+	if shouldDispatchNow {
+		// 运行中：立即派发，避免错过当前已处理槽的任务
+		if e.running || !e.startedOnce {
+			e.dispatchTask(task)
+			return true
+		}
+
+		// 停止中：不派发新回调，转为入队到下一可处理槽，等待后续 Start+Tick 执行
+		nextSlotKey := currentSlotKey + e.resolution
+		if nextSlotKey <= e.lastProcessedSlot {
+			nextSlotKey = e.lastProcessedSlot + e.resolution
+		}
+		slotKey = nextSlotKey
 	}
 
 	// 将任务添加到对应的时间槽
@@ -380,6 +391,7 @@ func (e *Engine[T]) Start() {
 		return
 	}
 	e.running = true
+	e.startedOnce = true
 	e.stopChan = make(chan struct{})
 	e.mu.Unlock()
 
@@ -454,6 +466,12 @@ func (e *Engine[T]) run() {
 		case <-stopChan:
 			return
 		case <-ticker.C:
+			// stopChan 与 ticker 同时就绪时，优先退出，避免 Stop 后多执行一次 Tick。
+			select {
+			case <-stopChan:
+				return
+			default:
+			}
 			e.Tick()
 		}
 	}

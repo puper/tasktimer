@@ -284,6 +284,47 @@ func TestStartStop(t *testing.T) {
 	}
 }
 
+func TestAddDueTaskAfterStopDispatchOnRestart(t *testing.T) {
+	engine := New[int](100 * time.Millisecond)
+	engine.Start()
+
+	// 先运行一段时间，确保已进入稳定 Tick 阶段
+	time.Sleep(150 * time.Millisecond)
+	engine.Stop()
+
+	var callbackCount int32
+	engine.Add(&Task[int]{
+		JobID:     "due-after-stop",
+		ExecuteAt: time.Now().Add(-10 * time.Millisecond).UnixMilli(),
+		Data:      1,
+		Callback: func(task *Task[int]) {
+			atomic.AddInt32(&callbackCount, 1)
+		},
+	})
+
+	// 停止状态下不应派发新回调
+	time.Sleep(120 * time.Millisecond)
+	if atomic.LoadInt32(&callbackCount) != 0 {
+		t.Fatal("task should not be dispatched while engine is stopped")
+	}
+
+	engine.Start()
+	defer engine.Stop()
+
+	// 重启后应在后续 Tick 中被执行
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&callbackCount) > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if atomic.LoadInt32(&callbackCount) == 0 {
+		t.Fatal("task added during stop should execute after restart")
+	}
+}
+
 func TestStopAndWaitSuccess(t *testing.T) {
 	engine := New[int](50 * time.Millisecond)
 	engine.Start()
